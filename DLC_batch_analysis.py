@@ -1,10 +1,9 @@
 """
-Batch DLC analysis pipeline for a single day (e.g. D5)
+Batch DLC analysis pipeline for multiple days.
 Steps:
-  1. Find all D5 mp4s in the folder
-  2. Pick one randomly, pop up corner-click UI to define homography
-  3. Warp all D5 videos using that homography -> save corrected videos
-  4. Run DLC batch analysis (Faster R-CNN + HRNet-w32) on corrected videos
+  1. For each day tag, find all matching mp4s
+  2. Pop up corner-click UI for ALL days first before any processing
+  3. Then warp all videos and run DLC unattended
 """
 
 import os
@@ -20,23 +19,21 @@ import deeplabcut
 # ─────────────────────────────────────────────
 # CONFIG — edit these
 # ─────────────────────────────────────────────
-VIDEO_FOLDER   = r"C:\Users\marce\Downloads"
-DLC_CONFIG     = r"C:\Users\marce\Documents\DeepLabCut\topmouse_project-marcel-2026-03-24\config.yaml"
-DAY_TAG        = "D5"                         # change to D1, D2 etc as needed
-OUTPUT_FOLDER  = os.path.join(VIDEO_FOLDER, f"{DAY_TAG}_DLC")
-OUTPUT_SIZE    = (1024, 768)                  # keep original frame size, no cropping
-CAP_MINUTES    = 15                           # cap each video to this many minutes
-TEST_MODE      = True                         # True = run on 1 video only to verify, False = all videos
+VIDEO_FOLDER = r"C:\Users\marce\Downloads"
+DLC_CONFIG   = r"C:\Users\marce\Documents\DeepLabCut\topmouse_project-marcel-2026-03-24\config.yaml"
+DAY_TAGS     = ["D1", "D2", "D3", "D4", "D5"]  # add/remove days as needed
+CAP_MINUTES  = 15                                # cap each video to this many minutes
+OUTPUT_SIZE  = (1024, 768)                       # keep original frame size, no cropping
+TEST_MODE    = False                             # True = 1 video per day only
 # ─────────────────────────────────────────────
 
 
-# ── Step 1: find all videos matching the day tag ──────────────────────────────
+# ── Step 1: find videos ───────────────────────────────────────────────────────
 
 def find_videos(folder, day_tag):
-    pattern = os.path.join(folder, "*.mp4")
-    all_mp4s = glob.glob(pattern)
-    matched = [f for f in all_mp4s if re.search(rf"_{day_tag}[_\.]", os.path.basename(f), re.IGNORECASE)
-               or os.path.basename(f).upper().endswith(f"_{day_tag}.MP4")]
+    all_mp4s = glob.glob(os.path.join(folder, "*.mp4"))
+    matched  = [f for f in all_mp4s if re.search(rf"_{day_tag}[_\.]", os.path.basename(f), re.IGNORECASE)
+                or os.path.basename(f).upper().endswith(f"_{day_tag}.MP4")]
     return sorted(matched)
 
 
@@ -49,7 +46,7 @@ def _mouse_callback(event, x, y, flags, param):
         clicked_points.append((x, y))
         print(f"  Corner {len(clicked_points)}: ({x}, {y})")
 
-def get_corners_from_user(video_path):
+def get_corners_from_user(video_path, day_tag):
     """
     Opens first frame of video. User clicks 4 arena corners
     in order: TOP-LEFT, TOP-RIGHT, BOTTOM-RIGHT, BOTTOM-LEFT
@@ -64,12 +61,12 @@ def get_corners_from_user(video_path):
     assert ret, f"Could not read frame from {video_path}"
 
     display = frame.copy()
-    window  = "Click 4 arena corners: TL -> TR -> BR -> BL   |   r=reset  Enter=confirm"
+    window  = f"[{day_tag}] Click 4 corners: TL -> TR -> BR -> BL  |  r=reset  Enter=confirm"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window, 900, 700)
     cv2.setMouseCallback(window, _mouse_callback)
 
-    print("\nClick corners in order: TOP-LEFT, TOP-RIGHT, BOTTOM-RIGHT, BOTTOM-LEFT")
+    print(f"\n[{day_tag}] Click corners: TOP-LEFT, TOP-RIGHT, BOTTOM-RIGHT, BOTTOM-LEFT")
 
     while True:
         vis = display.copy()
@@ -86,7 +83,7 @@ def get_corners_from_user(video_path):
         key = cv2.waitKey(20) & 0xFF
         if key == ord('r'):
             clicked_points = []
-            print("  Reset. Click 4 corners again.")
+            print(f"  [{day_tag}] Reset. Click 4 corners again.")
         elif key in (13, ord('q')) and len(clicked_points) == 4:
             break
 
@@ -94,30 +91,22 @@ def get_corners_from_user(video_path):
     return np.array(clicked_points, dtype=np.float32)
 
 
-def compute_homography(src_corners, out_size):
-    """
-    Straighten the arena while keeping the full original frame size.
-    The clicked corners are mapped to a rectangle that preserves their
-    relative position in the frame — no cropping, black fill in empty corners.
-    """
+def compute_homography(src_corners):
     xs = src_corners[:, 0]
     ys = src_corners[:, 1]
     x_min, x_max = xs.min(), xs.max()
     y_min, y_max = ys.min(), ys.max()
-
     dst = np.array([
-        [x_min, y_min],   # TL
-        [x_max, y_min],   # TR
-        [x_max, y_max],   # BR
-        [x_min, y_max],   # BL
+        [x_min, y_min],
+        [x_max, y_min],
+        [x_max, y_max],
+        [x_min, y_max],
     ], dtype=np.float32)
-
     H, _ = cv2.findHomography(src_corners, dst)
     return H
 
 
 def save_corners(src_corners, day_tag, ref_video, output_folder):
-    """Save clicked corners to a YAML file for future reference."""
     data = {
         "day_tag"        : day_tag,
         "date_saved"     : datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -138,38 +127,33 @@ def save_corners(src_corners, day_tag, ref_video, output_folder):
     return yaml_path
 
 
-# ── Step 3: warp a single video ───────────────────────────────────────────────
+# ── Step 3: warp videos ───────────────────────────────────────────────────────
 
 def get_animal_folder(base_folder, video_path):
-    """Extract animal ID from filename and create a subfolder for it.
-    Filename format: {ID}_M{mouse#}_D{day}_{condition}.mp4
-    Subfolder will be e.g. M01, M03 etc.
-    """
-    basename = os.path.basename(video_path)
-    match = re.search(r'_(M\d+)_', basename)
+    basename  = os.path.basename(video_path)
+    match     = re.search(r'_(M\d+)_', basename)
     animal_id = match.group(1) if match else "unknown"
-    folder = os.path.join(base_folder, animal_id)
+    folder    = os.path.join(base_folder, animal_id)
     os.makedirs(folder, exist_ok=True)
     return folder, animal_id
 
 
-def warp_video(src_path, dst_path, H, out_size):
-    cap = cv2.VideoCapture(src_path)
+def warp_video(src_path, dst_path, H):
+    cap        = cv2.VideoCapture(src_path)
     fps_src    = cap.get(cv2.CAP_PROP_FPS)
     max_frames = int(CAP_MINUTES * 60 * fps_src)
     total      = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), max_frames)
-    print(f"  Warping {os.path.basename(src_path)}  ({total} frames @ {fps_src:.1f} fps = {CAP_MINUTES} min cap)...")
+    print(f"  Warping {os.path.basename(src_path)} ({total} frames @ {fps_src:.1f} fps = {CAP_MINUTES} min cap)...")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out    = cv2.VideoWriter(dst_path, fourcc, fps_src, out_size)
+    out    = cv2.VideoWriter(dst_path, cv2.VideoWriter_fourcc(*"mp4v"), fps_src, OUTPUT_SIZE)
 
     frame_idx = 0
     while frame_idx < max_frames:
         ret, frame = cap.read()
         if not ret:
             break
-        warped = cv2.warpPerspective(frame, H, out_size)
-        out.write(warped)
+        out.write(cv2.warpPerspective(frame, H, OUTPUT_SIZE))
         frame_idx += 1
         if frame_idx % 500 == 0:
             print(f"    {frame_idx}/{total} frames done")
@@ -179,17 +163,17 @@ def warp_video(src_path, dst_path, H, out_size):
     print(f"  Saved -> {dst_path}")
 
 
-# ── Step 4: DLC batch analysis ────────────────────────────────────────────────
+# ── Step 4: DLC analysis ──────────────────────────────────────────────────────
 
-def run_dlc(config_path, video_list):
-    print("\n── Running DeepLabCut analysis ──────────────────────")
+def run_dlc(video_list):
+    print(f"\n── Running DeepLabCut on {len(video_list)} videos ──────────────────")
     deeplabcut.analyze_videos(
-        config_path,
+        DLC_CONFIG,
         video_list,
-        videotype    = "mp4",
-        shuffle      = 1,
-        save_as_csv  = True,
-        destfolder   = None,
+        videotype   = "mp4",
+        shuffle     = 1,
+        save_as_csv = True,
+        destfolder  = None,
     )
     print("DLC analysis complete.")
 
@@ -197,41 +181,68 @@ def run_dlc(config_path, video_list):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-    # 1. find videos
-    videos = find_videos(VIDEO_FOLDER, DAY_TAG)
-    if not videos:
-        raise FileNotFoundError(f"No mp4 files found with tag '{DAY_TAG}' in {VIDEO_FOLDER}")
-    print(f"Found {len(videos)} videos for {DAY_TAG}:")
-    for v in videos:
-        print(f"  {os.path.basename(v)}")
+    # ── Phase 1: collect all videos and do ALL corner clicking upfront ────────
+    print("=" * 60)
+    print("PHASE 1 — Corner selection for all days")
+    print("=" * 60)
 
-    # test mode: only process one video
-    if TEST_MODE:
-        videos = [random.choice(videos)]
-        print(f"\nTEST MODE: only processing {os.path.basename(videos[0])}")
+    day_data = {}  # day_tag -> {videos, H, output_folder}
 
-    # 2. pick random video for corner selection
-    ref_video = random.choice(videos)
-    print(f"\nUsing reference video for corner selection:\n  {os.path.basename(ref_video)}")
-    src_corners = get_corners_from_user(ref_video)
-    H = compute_homography(src_corners, OUTPUT_SIZE)
-    save_corners(src_corners, DAY_TAG, ref_video, OUTPUT_FOLDER)
-    print(f"\nHomography matrix:\n{H}")
+    for day_tag in DAY_TAGS:
+        output_folder = os.path.join(VIDEO_FOLDER, f"{day_tag}_DLC")
+        os.makedirs(output_folder, exist_ok=True)
 
-    # 3. warp all videos
-    print(f"\n── Warping {len(videos)} videos ────────────────────────────")
-    corrected_videos = []
-    for vp in videos:
-        animal_folder, animal_id = get_animal_folder(OUTPUT_FOLDER, vp)
-        stem     = os.path.splitext(os.path.basename(vp))[0]
-        dst_path = os.path.join(animal_folder, f"{stem}_corrected.mp4")
-        warp_video(vp, dst_path, H, OUTPUT_SIZE)
-        corrected_videos.append(dst_path)
+        videos = find_videos(VIDEO_FOLDER, day_tag)
+        if not videos:
+            print(f"\n[{day_tag}] No videos found — skipping.")
+            continue
 
-    # 4. DLC
-    run_dlc(DLC_CONFIG, corrected_videos)
+        if TEST_MODE:
+            videos = [random.choice(videos)]
+
+        print(f"\n[{day_tag}] Found {len(videos)} videos:")
+        for v in videos:
+            print(f"  {os.path.basename(v)}")
+
+        ref_video   = random.choice(videos)
+        print(f"  Reference video: {os.path.basename(ref_video)}")
+        src_corners = get_corners_from_user(ref_video, day_tag)
+        H           = compute_homography(src_corners)
+        save_corners(src_corners, day_tag, ref_video, output_folder)
+
+        day_data[day_tag] = {
+            "videos"       : videos,
+            "H"            : H,
+            "output_folder": output_folder,
+        }
+
+    if not day_data:
+        print("No valid days found. Check VIDEO_FOLDER and DAY_TAGS.")
+        return
+
+    # ── Phase 2: warp all videos unattended ───────────────────────────────────
+    print("\n" + "=" * 60)
+    print("PHASE 2 — Warping videos (unattended)")
+    print("=" * 60)
+
+    all_corrected = []
+
+    for day_tag, data in day_data.items():
+        print(f"\n── {day_tag}: warping {len(data['videos'])} videos ──")
+        for vp in data["videos"]:
+            animal_folder, _ = get_animal_folder(data["output_folder"], vp)
+            stem     = os.path.splitext(os.path.basename(vp))[0]
+            dst_path = os.path.join(animal_folder, f"{stem}_corrected.mp4")
+            warp_video(vp, dst_path, data["H"])
+            all_corrected.append(dst_path)
+
+    # ── Phase 3: DLC on everything ────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("PHASE 3 — DLC analysis (unattended)")
+    print("=" * 60)
+
+    run_dlc(all_corrected)
 
     print("\n✓ All done.")
 
