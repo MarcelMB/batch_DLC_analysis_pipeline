@@ -617,8 +617,35 @@ def plot_pipeline_figure(stages, arena_bounds, config, metrics, meta, save_path,
 # PLOTTING — summary boxplots
 # ============================================================================
 
+def _p_to_stars(p):
+    if p < 0.001:
+        return "***"
+    elif p < 0.01:
+        return "**"
+    elif p < 0.05:
+        return "*"
+    return "n.s."
+
+
+def _fmt_p(p):
+    if p < 0.001:
+        return "p < 0.001"
+    elif p < 0.05:
+        return f"p = {p:.3f}"
+    return f"p = {p:.2f}"
+
+
 def plot_summary_boxplots(results_df, save_path):
-    """Boxplots with color-coded animal data points and legend."""
+    """Two-row summary plot.
+
+    Top row:  Median line + individual animal data points (per-animal view)
+    Bottom row: Clean boxplots + Friedman test (repeated measures) with
+                Wilcoxon signed-rank pairwise tests between consecutive days
+    Uses only D1-D5 where all animals are present.
+    """
+    from matplotlib.lines import Line2D
+    from scipy.stats import friedmanchisquare, wilcoxon
+
     # (column, label, unit_transform, y_label, ylim)
     metrics_to_plot = [
         ("total_distance_cm", "Total Distance", lambda x: x / 100, "Distance (m)", (0, 100)),
@@ -628,70 +655,165 @@ def plot_summary_boxplots(results_df, save_path):
         ("arena_coverage_pct", "Arena Coverage", lambda x: x, "Coverage (%)", (0, 100)),
         ("immobility_time_s", "Immobility Time", lambda x: x / 60, "Time (min)", None),
     ]
-    days = sorted(results_df["Day"].unique())
+
+    # Use only D1-D5 for statistics (complete repeated measures)
+    stat_days = ["D1", "D2", "D3", "D4", "D5"]
+    stat_df = results_df[results_df["Day"].isin(stat_days)]
+
+    # Find animals present on ALL stat_days
+    animal_counts = stat_df.groupby("Animal")["Day"].nunique()
+    complete_animals = sorted(animal_counts[animal_counts == len(stat_days)].index.tolist())
+
+    # All days for plotting (may include D6 etc.)
+    all_days = sorted(results_df["Day"].unique())
     animals = sorted(results_df["Animal"].unique())
+    n_metrics = len(metrics_to_plot)
 
     # Assign a unique color + marker combo to each animal (supports up to 10)
-    animal_colors = {}
-    animal_markers = {}
     cmap_colors = [
         "#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
         "#a65628", "#f781bf", "#1b9e77", "#d95f02", "#666666",
     ]
-    markers = ["o", "s", "D", "^", "v", "P", "X", "h", "*", "p"]
-    for i, a in enumerate(animals):
-        animal_colors[a] = cmap_colors[i % len(cmap_colors)]
-        animal_markers[a] = markers[i % len(markers)]
+    marker_list = ["o", "s", "D", "^", "v", "P", "X", "h", "*", "p"]
+    animal_colors = {a: cmap_colors[i % len(cmap_colors)] for i, a in enumerate(animals)}
+    animal_markers = {a: marker_list[i % len(marker_list)] for i, a in enumerate(animals)}
 
-    fig, axes = plt.subplots(1, 6, figsize=(28, 5.5))
-    for ax, (col, title, transform, ylabel, ylim) in zip(axes, metrics_to_plot):
+    fig, axes = plt.subplots(2, n_metrics, figsize=(28, 11))
+
+    for col_idx, (col, title, transform, ylabel, ylim) in enumerate(metrics_to_plot):
+        ax_top = axes[0, col_idx]
+        ax_bot = axes[1, col_idx]
+
         data_by_day = [transform(results_df[results_df["Day"] == d][col].values)
-                       for d in days]
+                       for d in all_days]
+        day_x = list(range(1, len(all_days) + 1))
 
-        ax.boxplot(data_by_day, tick_labels=days, widths=0.5,
-                   patch_artist=True, showfliers=False,
-                   boxprops=dict(facecolor="lightblue", alpha=0.4),
-                   medianprops=dict(color="black", linewidth=1.5))
+        # ── Top row: median line + individual data points ──
+        medians = [np.median(d) for d in data_by_day]
+        ax_top.plot(day_x, medians, color="black", linewidth=1.5, zorder=2,
+                    marker="_", markersize=12, markeredgewidth=2)
 
-        # Overlay individual animal points, color-coded
-        for i, d in enumerate(days):
+        for i, d in enumerate(all_days):
             day_df = results_df[results_df["Day"] == d].sort_values("Animal")
             n_animals = len(day_df)
-            offsets = np.linspace(-0.15, 0.15, n_animals)
+            offsets = np.linspace(-0.2, 0.2, n_animals)
             for j, (_, row) in enumerate(day_df.iterrows()):
                 animal = row["Animal"]
                 val = transform(np.array([row[col]]))[0]
-                ax.scatter(i + 1 + offsets[j], val,
-                           c=animal_colors[animal], marker=animal_markers[animal],
-                           s=50, alpha=0.9, edgecolors="black", linewidths=0.5,
-                           zorder=3)
+                ax_top.scatter(i + 1 + offsets[j], val,
+                               c=animal_colors[animal], marker=animal_markers[animal],
+                               s=55, alpha=0.9, edgecolors="black", linewidths=0.5,
+                               zorder=3)
 
-        ax.set_ylabel(ylabel)
-        ax.set_xlabel("Day")
-        ax.set_title(title, fontsize=10)
+        ax_top.set_xticks(day_x)
+        ax_top.set_xticklabels(all_days)
+        ax_top.set_ylabel(ylabel)
+        ax_top.set_title(title, fontsize=10)
 
-    # Set ylims AFTER all plotting is done (scatter can trigger autoscale)
-    for ax, (col, title, transform, ylabel, ylim) in zip(axes, metrics_to_plot):
+        # ── Bottom row: clean boxplots + repeated-measures stats (D1-D5) ──
+        bp = ax_bot.boxplot(data_by_day, tick_labels=all_days, widths=0.5,
+                            patch_artist=True, showfliers=False,
+                            boxprops=dict(facecolor="lightblue", alpha=0.5),
+                            medianprops=dict(color="black", linewidth=2),
+                            whiskerprops=dict(color="gray"),
+                            capprops=dict(color="gray"))
+
+        # Build paired data matrix for complete animals across stat_days
+        if len(complete_animals) >= 5 and len(stat_days) >= 3:
+            paired_data = {}  # day -> array of values in animal order
+            for d in stat_days:
+                day_vals = []
+                for a in complete_animals:
+                    row = stat_df[(stat_df["Day"] == d) & (stat_df["Animal"] == a)]
+                    day_vals.append(transform(np.array([row[col].values[0]]))[0])
+                paired_data[d] = np.array(day_vals)
+
+            # Friedman test (repeated measures)
+            friedman_arrays = [paired_data[d] for d in stat_days]
+            chi2, p_fried = friedmanchisquare(*friedman_arrays)
+            sig_color = "#e67e22" if p_fried < 0.05 else "#555555"
+            ax_bot.text(0.98, 0.97,
+                        f"Friedman (n={len(complete_animals)})\n"
+                        f"\u03c7\u00b2 = {chi2:.1f}, {_fmt_p(p_fried)}",
+                        transform=ax_bot.transAxes, fontsize=7, ha="right", va="top",
+                        color=sig_color,
+                        fontweight="bold" if p_fried < 0.05 else "normal",
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                                  edgecolor=sig_color, alpha=0.8))
+
+            # Wilcoxon signed-rank pairwise: consecutive days
+            # Place brackets just above the highest whisker of each pair
+            all_whisker_tops = []
+            for dvals in data_by_day:
+                if len(dvals) > 0:
+                    q3 = np.percentile(dvals, 75)
+                    iqr = q3 - np.percentile(dvals, 25)
+                    whisker_top = min(q3 + 1.5 * iqr, np.max(dvals))
+                    all_whisker_tops.append(whisker_top)
+                else:
+                    all_whisker_tops.append(0)
+
+            bracket_gap = (max(all_whisker_tops) - min(all_whisker_tops)) * 0.08
+            if bracket_gap == 0:
+                bracket_gap = max(all_whisker_tops) * 0.05
+            tick_h = bracket_gap * 0.3
+
+            for k in range(len(stat_days) - 1):
+                d1, d2 = stat_days[k], stat_days[k + 1]
+                x1 = all_days.index(d1) + 1
+                x2 = all_days.index(d2) + 1
+                idx1 = all_days.index(d1)
+                idx2 = all_days.index(d2)
+                _, p_wil = wilcoxon(paired_data[d1], paired_data[d2])
+                stars = _p_to_stars(p_wil)
+                # Position just above the higher whisker of the two days
+                top_val = max(all_whisker_tops[idx1], all_whisker_tops[idx2])
+                by = top_val + bracket_gap + k * bracket_gap
+                star_color = "#e67e22" if p_wil < 0.05 else "#bbbbbb"
+                # Draw bracket
+                ax_bot.plot([x1, x1, x2, x2], [by - tick_h, by, by, by - tick_h],
+                            color=star_color, linewidth=1.0, clip_on=False)
+                ax_bot.text((x1 + x2) / 2, by + tick_h * 0.3, stars,
+                            ha="center", va="bottom", fontsize=7.5,
+                            color=star_color,
+                            fontweight="bold" if p_wil < 0.05 else "normal",
+                            clip_on=False)
+
+        ax_bot.set_ylabel(ylabel)
+        ax_bot.set_xlabel("Day")
+
+        # Apply ylims — top row uses data range, bottom row adds headroom for brackets
         if ylim is not None:
-            ax.set_ylim(ylim)
+            ax_top.set_ylim(ylim)
+            ax_bot.set_ylim(ylim[0], ylim[1] * 1.15)
         else:
-            all_vals = np.concatenate([transform(results_df[col].values)])
-            ax.set_ylim(0, all_vals.max() * 1.15)
+            all_vals = transform(results_df[col].values)
+            ax_top.set_ylim(0, np.max(all_vals) * 1.15)
+            ax_bot.set_ylim(0, np.max(all_vals) * 1.30)
 
-    # Create shared legend on the right
-    from matplotlib.lines import Line2D
+    # Shared legend for top row (animal identity)
     legend_handles = [
         Line2D([0], [0], marker=animal_markers[a], color="w",
                markerfacecolor=animal_colors[a], markeredgecolor="black",
                markersize=8, label=a)
         for a in animals
     ]
-    fig.legend(handles=legend_handles, loc="center right",
-               title="Animal", fontsize=9, title_fontsize=10,
-               bbox_to_anchor=(1.0, 0.5))
+    axes[0, -1].legend(handles=legend_handles, loc="upper left",
+                       title="Animal", fontsize=7, title_fontsize=8,
+                       bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
 
-    fig.suptitle("Behavior Metrics Summary (D1-D5)", fontsize=13)
-    fig.tight_layout(rect=[0, 0, 0.93, 0.95])
+    # Row labels
+    axes[0, 0].annotate("Individual animals", xy=(0, 0.5),
+                        xytext=(-0.35, 0.5), xycoords="axes fraction",
+                        fontsize=10, fontweight="bold", rotation=90,
+                        va="center", ha="center")
+    axes[1, 0].annotate("Day-to-day trend", xy=(0, 0.5),
+                        xytext=(-0.35, 0.5), xycoords="axes fraction",
+                        fontsize=10, fontweight="bold", rotation=90,
+                        va="center", ha="center")
+
+    fig.suptitle("Behavior Metrics Summary — Naive Baseline", fontsize=14, y=0.98)
+    fig.tight_layout(rect=[0.03, 0, 0.93, 0.96])
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
