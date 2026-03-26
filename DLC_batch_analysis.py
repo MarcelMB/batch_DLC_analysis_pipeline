@@ -19,9 +19,9 @@ import deeplabcut
 # ─────────────────────────────────────────────
 # CONFIG — edit these
 # ─────────────────────────────────────────────
-VIDEO_FOLDER = r"C:\Users\marce\Downloads"
+VIDEO_FOLDER = r"D:\marcel\Miniscope_Zero_2025_11\v4_vs_MSzero_behavior\raw_videos\right_camera_2_raw_video"
 DLC_CONFIG   = r"C:\Users\marce\Documents\DeepLabCut\topmouse_project-marcel-2026-03-24\config.yaml"
-DAY_TAGS     = ["D1", "D2", "D3", "D4", "D5"]  # add/remove days as needed
+DAY_TAGS     = ["D1", "D2", "D3", "D4", "D5","D6"]  # add/remove days as needed
 CAP_MINUTES  = 15                                # cap each video to this many minutes
 OUTPUT_SIZE  = (1024, 768)                       # keep original frame size, no cropping
 TEST_MODE    = False                             # True = 1 video per day only
