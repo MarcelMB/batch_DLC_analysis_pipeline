@@ -19,12 +19,13 @@ import deeplabcut
 # ─────────────────────────────────────────────
 # CONFIG — edit these
 # ─────────────────────────────────────────────
-VIDEO_FOLDER = r"D:\marcel\Miniscope_Zero_2025_11\v4_vs_MSzero_behavior\raw_videos\right_camera_2_raw_video"
+VIDEO_FOLDER = r"D:\marcel\Miniscope_Zero_2025_11\v4_vs_MSzero_behavior\raw_videos\left_camera_1_raw_video"
 DLC_CONFIG   = r"C:\Users\marce\Documents\DeepLabCut\topmouse_project-marcel-2026-03-24\config.yaml"
-DAY_TAGS     = ["D1", "D2", "D3", "D4", "D5","D6"]  # add/remove days as needed
+DAY_TAGS     = ["D16"]  # add/remove days as needed
 CAP_MINUTES  = 15                                # cap each video to this many minutes
 OUTPUT_SIZE  = (1024, 768)                       # keep original frame size, no cropping
 TEST_MODE    = False                             # True = 1 video per day only
+DLC_ONLY     = False                            # True = skip warping, run DLC on existing corrected videos
 # ─────────────────────────────────────────────
 
 
@@ -180,7 +181,45 @@ def run_dlc(video_list):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def find_corrected_videos_needing_dlc(video_folder, day_tags):
+    """Find corrected videos that don't yet have DLC .h5 output."""
+    pending = []
+    for day_tag in day_tags:
+        dlc_dir = os.path.join(video_folder, f"{day_tag}_DLC")
+        if not os.path.isdir(dlc_dir):
+            continue
+        for animal_dir in sorted(glob.glob(os.path.join(dlc_dir, "M*"))):
+            if not os.path.isdir(animal_dir):
+                continue
+            for mp4 in glob.glob(os.path.join(animal_dir, "*_corrected.mp4")):
+                # Check if .h5 output already exists for this video
+                h5_files = glob.glob(os.path.join(animal_dir, "*.h5"))
+                if not h5_files:
+                    pending.append(mp4)
+    return pending
+
+
 def main():
+
+    if DLC_ONLY:
+        # ── DLC-only mode: skip warping, run DLC on corrected videos missing output ──
+        print("=" * 60)
+        print("DLC-ONLY MODE — finding corrected videos without DLC output")
+        print("=" * 60)
+
+        pending = find_corrected_videos_needing_dlc(VIDEO_FOLDER, DAY_TAGS)
+
+        if not pending:
+            print("All corrected videos already have DLC output. Nothing to do.")
+            return
+
+        print(f"\nFound {len(pending)} videos needing DLC analysis:")
+        for v in pending:
+            print(f"  {os.path.relpath(v, VIDEO_FOLDER)}")
+
+        run_dlc(pending)
+        print("\n✓ All done.")
+        return
 
     # ── Phase 1: collect all videos and do ALL corner clicking upfront ────────
     print("=" * 60)

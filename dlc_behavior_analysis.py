@@ -35,7 +35,7 @@ CONFIG = {
     "immobility_threshold_cms": 2.0,    # cm/s
     "max_speed_cms": 50.0,              # physiological max — flag as artifact
     "speed_pad_frames": 3,              # expand flagged speed windows by N frames
-    "center_zone_fraction": 0.25,       # inner 25% of area
+    "center_zone_fraction": 0.20,       # inner 20% of area
     "coverage_bin_size_cm": 1.0,        # 1 cm grid
     "primary_bodypart": "mouse_center",
     "fallback_bodypart": "tail_base",
@@ -636,17 +636,20 @@ def _fmt_p(p):
 
 
 def plot_summary_boxplots(results_df, save_path):
-    """Two-row summary plot.
+    """Full-experiment summary plot with phase color-coding.
 
-    Top row:  Median line + individual animal data points (per-animal view)
-    Bottom row: Clean boxplots + Friedman test (repeated measures) with
-                Wilcoxon signed-rank pairwise tests between consecutive days
-    Uses only D1-D5 where all animals are present.
+    Top row:  Individual animal data points with median line, color-coded
+              by phase. D8+ points filled by miniscope type.
+    Bottom row: Boxplots color-coded by phase. D8+ split into MS_Zero /
+                v4_MS side-by-side.
+
+    Phases:  D1-D4 = Arena habituation (blue)
+             D5-D7 = Naive test (teal)
+             D8-D16 = Scope habituation: MS_Zero (green) / v4_MS (purple)
+    Note: M04 drops out from D15 onward (scope no longer available).
     """
     from matplotlib.lines import Line2D
-    from scipy.stats import friedmanchisquare, wilcoxon
 
-    # (column, label, unit_transform, y_label, ylim)
     metrics_to_plot = [
         ("total_distance_cm", "Total Distance", lambda x: x / 100, "Distance (m)", (0, 100)),
         ("median_speed_cms", "Median Speed\n(all frames)", lambda x: x, "Speed (cm/s)", (0, 5)),
@@ -656,150 +659,241 @@ def plot_summary_boxplots(results_df, save_path):
         ("immobility_time_s", "Immobility Time", lambda x: x / 60, "Time (min)", None),
     ]
 
-    # Use only D1-D5 for statistics (complete repeated measures)
-    stat_days = ["D1", "D2", "D3", "D4", "D5"]
-    stat_df = results_df[results_df["Day"].isin(stat_days)]
+    # Phase definitions
+    color_hab   = "#5b9bd5"  # blue  – habituation
+    color_naive = "#2ca89a"  # teal  – naive test
+    color_zero  = "#4daf4a"  # green – MS_Zero
+    color_v4    = "#984ea3"  # purple – v4_MS
 
-    # Find animals present on ALL stat_days
-    animal_counts = stat_df.groupby("Animal")["Day"].nunique()
-    complete_animals = sorted(animal_counts[animal_counts == len(stat_days)].index.tolist())
+    # Derive day number and miniscope condition
+    df = results_df.copy()
+    df["day_num"] = df["Day"].str[1:].astype(int)
+    df["Miniscope"] = df["Camera"].map({
+        "left_camera": "MS_Zero", "right_camera": "v4_MS"})
 
-    # All days for plotting (may include D6 etc.)
-    all_days = sorted(results_df["Day"].unique())
-    animals = sorted(results_df["Animal"].unique())
-    n_metrics = len(metrics_to_plot)
+    all_days = sorted(df["Day"].unique(), key=lambda d: int(d[1:]))
+    naive_days = [d for d in all_days if int(d[1:]) <= 7]
+    ms_days    = [d for d in all_days if int(d[1:]) >= 8]
 
-    # Assign a unique color + marker combo to each animal (supports up to 10)
+    def _phase_color(day):
+        dn = int(day[1:])
+        if dn <= 4:
+            return color_hab
+        elif dn <= 7:
+            return color_naive
+        return "gray"  # shouldn't be used for pooled boxes on D8+
+
+    # Animal identity markers (for top row)
+    animals = sorted(df["Animal"].unique())
     cmap_colors = [
         "#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
         "#a65628", "#f781bf", "#1b9e77", "#d95f02", "#666666",
     ]
     marker_list = ["o", "s", "D", "^", "v", "P", "X", "h", "*", "p"]
-    animal_colors = {a: cmap_colors[i % len(cmap_colors)] for i, a in enumerate(animals)}
-    animal_markers = {a: marker_list[i % len(marker_list)] for i, a in enumerate(animals)}
+    animal_colors  = {a: cmap_colors[i % len(cmap_colors)]
+                      for i, a in enumerate(animals)}
+    animal_markers = {a: marker_list[i % len(marker_list)]
+                      for i, a in enumerate(animals)}
 
-    fig, axes = plt.subplots(2, n_metrics, figsize=(28, 11))
+    n_metrics = len(metrics_to_plot)
+    fig, axes = plt.subplots(2, n_metrics, figsize=(30, 11))
 
-    for col_idx, (col, title, transform, ylabel, ylim) in enumerate(metrics_to_plot):
+    for col_idx, (col, title, transform, ylabel, ylim) in enumerate(
+            metrics_to_plot):
         ax_top = axes[0, col_idx]
         ax_bot = axes[1, col_idx]
 
-        data_by_day = [transform(results_df[results_df["Day"] == d][col].values)
-                       for d in all_days]
-        day_x = list(range(1, len(all_days) + 1))
+        # ----- build x-positions -----
+        # Naive days get integer positions 1..N_naive.
+        # Miniscope days get two sub-positions each (MS_Zero, v4_MS).
+        x_tick_pos = []     # tick position for each day label
+        x_tick_labels = []  # label strings
+        x_pos = 1           # running position counter
+
+        # -- data containers for bottom-row boxplots --
+        bot_box_data = []
+        bot_box_pos  = []
+        bot_box_colors = []
+
+        # -- top-row scatter helpers --
+        top_scatter_info = []  # list of (day, x_center, x_left, x_right)
+
+        for day in all_days:
+            dn = int(day[1:])
+            if dn <= 7:
+                # Single pooled box
+                x_tick_pos.append(x_pos)
+                x_tick_labels.append(day)
+                vals = transform(df[df["Day"] == day][col].values)
+                bot_box_data.append(vals)
+                bot_box_pos.append(x_pos)
+                bot_box_colors.append(_phase_color(day))
+                top_scatter_info.append((day, x_pos, None, None))
+                x_pos += 1
+            else:
+                # Two side-by-side boxes
+                x_left  = x_pos - 0.2
+                x_right = x_pos + 0.2
+                x_tick_pos.append(x_pos)
+                x_tick_labels.append(day)
+
+                vals_z = transform(
+                    df[(df["Day"] == day) & (df["Miniscope"] == "MS_Zero")][col].values)
+                vals_v = transform(
+                    df[(df["Day"] == day) & (df["Miniscope"] == "v4_MS")][col].values)
+
+                if len(vals_z) > 0:
+                    bot_box_data.append(vals_z)
+                    bot_box_pos.append(x_left)
+                    bot_box_colors.append(color_zero)
+                if len(vals_v) > 0:
+                    bot_box_data.append(vals_v)
+                    bot_box_pos.append(x_right)
+                    bot_box_colors.append(color_v4)
+
+                top_scatter_info.append((day, x_pos, x_left, x_right))
+                x_pos += 1
+
+        # Add a small gap between naive and miniscope phases
+        if len(naive_days) > 0 and len(ms_days) > 0:
+            gap_idx = len(naive_days)  # index in x_tick_pos where ms starts
+            for k in range(gap_idx, len(x_tick_pos)):
+                x_tick_pos[k] += 0.5
+            for k in range(len(bot_box_pos)):
+                if bot_box_pos[k] > len(naive_days):
+                    bot_box_pos[k] += 0.5
+            for k in range(len(top_scatter_info)):
+                day, xc, xl, xr = top_scatter_info[k]
+                if int(day[1:]) >= 8:
+                    top_scatter_info[k] = (day, xc + 0.5,
+                                           xl + 0.5 if xl else None,
+                                           xr + 0.5 if xr else None)
 
         # ── Top row: median line + individual data points ──
-        medians = [np.median(d) for d in data_by_day]
-        ax_top.plot(day_x, medians, color="black", linewidth=1.5, zorder=2,
-                    marker="_", markersize=12, markeredgewidth=2)
+        # Median line for naive days only (pooled)
+        naive_medians_x = []
+        naive_medians_y = []
+        for day, xc, xl, xr in top_scatter_info:
+            if int(day[1:]) <= 7:
+                vals = transform(df[df["Day"] == day][col].values)
+                naive_medians_x.append(xc)
+                naive_medians_y.append(np.median(vals))
+        ax_top.plot(naive_medians_x, naive_medians_y, color="black",
+                    linewidth=1.5, zorder=2, marker="_", markersize=12,
+                    markeredgewidth=2)
 
-        for i, d in enumerate(all_days):
-            day_df = results_df[results_df["Day"] == d].sort_values("Animal")
-            n_animals = len(day_df)
-            offsets = np.linspace(-0.2, 0.2, n_animals)
-            for j, (_, row) in enumerate(day_df.iterrows()):
-                animal = row["Animal"]
-                val = transform(np.array([row[col]]))[0]
-                ax_top.scatter(i + 1 + offsets[j], val,
-                               c=animal_colors[animal], marker=animal_markers[animal],
-                               s=55, alpha=0.9, edgecolors="black", linewidths=0.5,
-                               zorder=3)
+        # Scatter individual points
+        for day, xc, xl, xr in top_scatter_info:
+            dn = int(day[1:])
+            day_df = df[df["Day"] == day].sort_values("Animal")
+            if dn <= 7:
+                n_animals = len(day_df)
+                offsets = np.linspace(-0.25, 0.25, n_animals)
+                for j, (_, row) in enumerate(day_df.iterrows()):
+                    animal = row["Animal"]
+                    val = transform(np.array([row[col]]))[0]
+                    ax_top.scatter(
+                        xc + offsets[j], val,
+                        c=animal_colors[animal],
+                        marker=animal_markers[animal],
+                        s=55, alpha=0.9, edgecolors="black",
+                        linewidths=0.5, zorder=3)
+            else:
+                # Split by miniscope
+                for ms_type, x_sub, ms_color in [
+                    ("MS_Zero", xl, color_zero),
+                    ("v4_MS",   xr, color_v4),
+                ]:
+                    if x_sub is None:
+                        continue
+                    sub = day_df[day_df["Miniscope"] == ms_type]
+                    n_sub = len(sub)
+                    if n_sub == 0:
+                        continue
+                    offsets = np.linspace(-0.08, 0.08, n_sub)
+                    for j, (_, row) in enumerate(sub.iterrows()):
+                        animal = row["Animal"]
+                        val = transform(np.array([row[col]]))[0]
+                        ax_top.scatter(
+                            x_sub + offsets[j], val,
+                            c=ms_color,
+                            marker=animal_markers[animal],
+                            s=55, alpha=0.85, edgecolors="black",
+                            linewidths=0.5, zorder=3)
 
-        ax_top.set_xticks(day_x)
-        ax_top.set_xticklabels(all_days)
+        ax_top.set_xticks(x_tick_pos)
+        ax_top.set_xticklabels(x_tick_labels, fontsize=8)
         ax_top.set_ylabel(ylabel)
         ax_top.set_title(title, fontsize=10)
 
-        # ── Bottom row: clean boxplots + repeated-measures stats (D1-D5) ──
-        bp = ax_bot.boxplot(data_by_day, tick_labels=all_days, widths=0.5,
-                            patch_artist=True, showfliers=False,
-                            boxprops=dict(facecolor="lightblue", alpha=0.5),
-                            medianprops=dict(color="black", linewidth=2),
-                            whiskerprops=dict(color="gray"),
-                            capprops=dict(color="gray"))
+        # Phase background shading (top row)
+        for day, xc, xl, xr in top_scatter_info:
+            pc = _phase_color(day)
+            if int(day[1:]) <= 7:
+                ax_top.axvspan(xc - 0.45, xc + 0.45, alpha=0.18,
+                               color=pc, zorder=0)
 
-        # Build paired data matrix for complete animals across stat_days
-        if len(complete_animals) >= 5 and len(stat_days) >= 3:
-            paired_data = {}  # day -> array of values in animal order
-            for d in stat_days:
-                day_vals = []
-                for a in complete_animals:
-                    row = stat_df[(stat_df["Day"] == d) & (stat_df["Animal"] == a)]
-                    day_vals.append(transform(np.array([row[col].values[0]]))[0])
-                paired_data[d] = np.array(day_vals)
+        # ── Bottom row: phase-colored boxplots ──
+        box_width = 0.38
+        bp = ax_bot.boxplot(
+            bot_box_data, positions=bot_box_pos,
+            widths=[box_width] * len(bot_box_data),
+            patch_artist=True, showfliers=False,
+            medianprops=dict(color="black", linewidth=2),
+            whiskerprops=dict(color="gray"),
+            capprops=dict(color="gray"))
+        for patch, fc in zip(bp["boxes"], bot_box_colors):
+            patch.set_facecolor(fc)
+            patch.set_alpha(0.55)
 
-            # Friedman test (repeated measures)
-            friedman_arrays = [paired_data[d] for d in stat_days]
-            chi2, p_fried = friedmanchisquare(*friedman_arrays)
-            sig_color = "#e67e22" if p_fried < 0.05 else "#555555"
-            ax_bot.text(0.98, 0.97,
-                        f"Friedman (n={len(complete_animals)})\n"
-                        f"\u03c7\u00b2 = {chi2:.1f}, {_fmt_p(p_fried)}",
-                        transform=ax_bot.transAxes, fontsize=7, ha="right", va="top",
-                        color=sig_color,
-                        fontweight="bold" if p_fried < 0.05 else "normal",
-                        bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
-                                  edgecolor=sig_color, alpha=0.8))
-
-            # Wilcoxon signed-rank pairwise: consecutive days
-            # Place brackets just above the highest whisker of each pair
-            all_whisker_tops = []
-            for dvals in data_by_day:
-                if len(dvals) > 0:
-                    q3 = np.percentile(dvals, 75)
-                    iqr = q3 - np.percentile(dvals, 25)
-                    whisker_top = min(q3 + 1.5 * iqr, np.max(dvals))
-                    all_whisker_tops.append(whisker_top)
-                else:
-                    all_whisker_tops.append(0)
-
-            bracket_gap = (max(all_whisker_tops) - min(all_whisker_tops)) * 0.08
-            if bracket_gap == 0:
-                bracket_gap = max(all_whisker_tops) * 0.05
-            tick_h = bracket_gap * 0.3
-
-            for k in range(len(stat_days) - 1):
-                d1, d2 = stat_days[k], stat_days[k + 1]
-                x1 = all_days.index(d1) + 1
-                x2 = all_days.index(d2) + 1
-                idx1 = all_days.index(d1)
-                idx2 = all_days.index(d2)
-                _, p_wil = wilcoxon(paired_data[d1], paired_data[d2])
-                stars = _p_to_stars(p_wil)
-                # Position just above the higher whisker of the two days
-                top_val = max(all_whisker_tops[idx1], all_whisker_tops[idx2])
-                by = top_val + bracket_gap + k * bracket_gap
-                star_color = "#e67e22" if p_wil < 0.05 else "#bbbbbb"
-                # Draw bracket
-                ax_bot.plot([x1, x1, x2, x2], [by - tick_h, by, by, by - tick_h],
-                            color=star_color, linewidth=1.0, clip_on=False)
-                ax_bot.text((x1 + x2) / 2, by + tick_h * 0.3, stars,
-                            ha="center", va="bottom", fontsize=7.5,
-                            color=star_color,
-                            fontweight="bold" if p_wil < 0.05 else "normal",
-                            clip_on=False)
-
+        ax_bot.set_xticks(x_tick_pos)
+        ax_bot.set_xticklabels(x_tick_labels, fontsize=8)
         ax_bot.set_ylabel(ylabel)
         ax_bot.set_xlabel("Day")
 
-        # Apply ylims — top row uses data range, bottom row adds headroom for brackets
+        # Phase background shading (bottom row)
+        for day, xc, xl, xr in top_scatter_info:
+            pc = _phase_color(day)
+            if int(day[1:]) <= 7:
+                ax_bot.axvspan(xc - 0.45, xc + 0.45, alpha=0.18,
+                               color=pc, zorder=0)
+
+        # y-limits
         if ylim is not None:
             ax_top.set_ylim(ylim)
-            ax_bot.set_ylim(ylim[0], ylim[1] * 1.15)
+            ax_bot.set_ylim(ylim)
         else:
-            all_vals = transform(results_df[col].values)
-            ax_top.set_ylim(0, np.max(all_vals) * 1.15)
-            ax_bot.set_ylim(0, np.max(all_vals) * 1.30)
+            all_vals = transform(df[col].values)
+            y_max = np.max(all_vals) * 1.10
+            ax_top.set_ylim(0, y_max)
+            ax_bot.set_ylim(0, y_max)
 
-    # Shared legend for top row (animal identity)
-    legend_handles = [
+    # ── Legends ──
+    # Animal identity legend (top row)
+    animal_handles = [
         Line2D([0], [0], marker=animal_markers[a], color="w",
                markerfacecolor=animal_colors[a], markeredgecolor="black",
                markersize=8, label=a)
         for a in animals
     ]
-    axes[0, -1].legend(handles=legend_handles, loc="upper left",
+    axes[0, -1].legend(handles=animal_handles, loc="upper left",
                        title="Animal", fontsize=7, title_fontsize=8,
+                       bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
+
+    # Phase legend (bottom row)
+    from matplotlib.patches import Patch
+    phase_handles = [
+        Patch(facecolor=color_hab,   alpha=0.55, edgecolor="black",
+              label="Habituation (D1\u2013D4)"),
+        Patch(facecolor=color_naive, alpha=0.55, edgecolor="black",
+              label="Naive test (D5\u2013D7)"),
+        Patch(facecolor=color_zero,  alpha=0.55, edgecolor="black",
+              label="MS_Zero (D8\u2013D16, left cam)"),
+        Patch(facecolor=color_v4,    alpha=0.55, edgecolor="black",
+              label="v4_MS (D8\u2013D16, right cam)"),
+    ]
+    axes[1, -1].legend(handles=phase_handles, loc="upper left",
+                       title="Phase", fontsize=7, title_fontsize=8,
                        bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
 
     # Row labels
@@ -812,10 +906,534 @@ def plot_summary_boxplots(results_df, save_path):
                         fontsize=10, fontweight="bold", rotation=90,
                         va="center", ha="center")
 
-    fig.suptitle("Behavior Metrics Summary — Naive Baseline", fontsize=14, y=0.98)
+    fig.suptitle("Behavior Metrics Summary", fontsize=14, y=0.98)
     fig.tight_layout(rect=[0.03, 0, 0.93, 0.96])
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
+
+
+def plot_miniscope_comparison(results_df, save_path):
+    """Two-row comparison plot for scope habituation days (D8–D16).
+
+    Top row:  Per-day side-by-side boxplots (MS_Zero vs v4_MS) with
+              Mann-Whitney U tests per day.
+    Bottom row: Overall pooled comparison across all scope habituation days
+                with individual animal data points.
+
+    Camera mapping: left_camera = MS_Zero, right_camera = v4_MS.
+    Note: M04 drops out from D15 onward (scope no longer available).
+    """
+    from matplotlib.lines import Line2D
+    from scipy.stats import mannwhitneyu
+
+    # Assign miniscope condition based on camera
+    df = results_df.copy()
+    df["Miniscope"] = df["Camera"].map({
+        "left_camera": "MS_Zero",
+        "right_camera": "v4_MS",
+    })
+
+    # Filter to miniscope days (D8+)
+    df["day_num"] = df["Day"].str[1:].astype(int)
+    ms_df = df[df["day_num"] >= 8].copy()
+    ms_days = sorted(ms_df["Day"].unique(), key=lambda d: int(d[1:]))
+
+    # Naive test days (D5-D7) for pooled baseline reference
+    naive_df = df[df["day_num"].between(5, 7)].copy()
+
+    if len(ms_days) == 0:
+        return
+
+    metrics_to_plot = [
+        ("total_distance_cm", "Total Distance", lambda x: x / 100, "Distance (m)", None),
+        ("median_speed_cms", "Median Speed\n(all frames)", lambda x: x, "Speed (cm/s)", None),
+        ("median_locomotion_speed_cms", "Median Locomotion Speed\n(excl. immobile)", lambda x: x, "Speed (cm/s)", None),
+        ("center_distance_cm", "Distance in Center", lambda x: x / 100, "Distance (m)", None),
+        ("arena_coverage_pct", "Arena Coverage", lambda x: x, "Coverage (%)", (0, 100)),
+        ("immobility_time_s", "Immobility Time", lambda x: x / 60, "Time (min)", None),
+    ]
+    n_metrics = len(metrics_to_plot)
+
+    color_naive = "#2ca89a"  # teal  – naive test
+    color_zero  = "#4daf4a"  # green – MS_Zero
+    color_v4    = "#984ea3"  # purple – v4_MS
+
+    fig, axes = plt.subplots(2, n_metrics, figsize=(28, 11))
+
+    for col_idx, (col, title, transform, ylabel, ylim) in enumerate(metrics_to_plot):
+        ax_top = axes[0, col_idx]
+        ax_bot = axes[1, col_idx]
+
+        # ── Top row: per-day side-by-side boxplots ──
+        positions_zero = []
+        positions_v4 = []
+        data_zero = []
+        data_v4 = []
+        box_width = 0.35
+
+        for i, day in enumerate(ms_days):
+            x_center = i + 1
+            day_data = ms_df[ms_df["Day"] == day]
+
+            vals_zero = transform(day_data[day_data["Miniscope"] == "MS_Zero"][col].values)
+            vals_v4   = transform(day_data[day_data["Miniscope"] == "v4_MS"][col].values)
+
+            data_zero.append(vals_zero)
+            data_v4.append(vals_v4)
+            positions_zero.append(x_center - box_width / 2 - 0.02)
+            positions_v4.append(x_center + box_width / 2 + 0.02)
+
+            # Mann-Whitney U per day
+            if len(vals_zero) >= 3 and len(vals_v4) >= 3:
+                _, p_val = mannwhitneyu(vals_zero, vals_v4, alternative="two-sided")
+                stars = _p_to_stars(p_val)
+                star_color = "#e67e22" if p_val < 0.05 else "#bbbbbb"
+                top_val = max(
+                    np.max(vals_zero) if len(vals_zero) > 0 else 0,
+                    np.max(vals_v4) if len(vals_v4) > 0 else 0,
+                )
+                ax_top.text(x_center, top_val * 1.05, stars,
+                            ha="center", va="bottom", fontsize=8,
+                            color=star_color,
+                            fontweight="bold" if p_val < 0.05 else "normal")
+
+        if len(data_zero) > 0:
+            ax_top.boxplot(data_zero, positions=positions_zero, widths=box_width,
+                           patch_artist=True, showfliers=False,
+                           boxprops=dict(facecolor=color_zero, alpha=0.5),
+                           medianprops=dict(color="black", linewidth=2),
+                           whiskerprops=dict(color="gray"),
+                           capprops=dict(color="gray"))
+        if len(data_v4) > 0:
+            ax_top.boxplot(data_v4, positions=positions_v4, widths=box_width,
+                           patch_artist=True, showfliers=False,
+                           boxprops=dict(facecolor=color_v4, alpha=0.5),
+                           medianprops=dict(color="black", linewidth=2),
+                           whiskerprops=dict(color="gray"),
+                           capprops=dict(color="gray"))
+
+        ax_top.set_xticks(list(range(1, len(ms_days) + 1)))
+        ax_top.set_xticklabels(ms_days)
+        ax_top.set_ylabel(ylabel)
+        ax_top.set_title(title, fontsize=10)
+
+        # ── Bottom row: pooled 3-group comparison ──
+        # Naive test (D5-D7), MS_Zero (D8+), v4_MS (D8+)
+        all_naive = transform(naive_df[col].values)
+        all_zero  = transform(ms_df[ms_df["Miniscope"] == "MS_Zero"][col].values)
+        all_v4    = transform(ms_df[ms_df["Miniscope"] == "v4_MS"][col].values)
+
+        grp_data   = [all_naive, all_zero, all_v4]
+        grp_pos    = [1, 2, 3]
+        grp_colors = [color_naive, color_zero, color_v4]
+        grp_labels = ["Naive\n(D5\u2013D7)", "MS_Zero\n(D8\u2013D16)", "v4_MS\n(D8\u2013D16)"]
+
+        bp_pool = ax_bot.boxplot(
+            grp_data, positions=grp_pos, widths=0.5,
+            patch_artist=True, showfliers=False,
+            medianprops=dict(color="black", linewidth=2),
+            whiskerprops=dict(color="gray"),
+            capprops=dict(color="gray"),
+        )
+        for patch, fc in zip(bp_pool["boxes"], grp_colors):
+            patch.set_facecolor(fc)
+            patch.set_alpha(0.5)
+
+        # Overlay individual points with jitter
+        rng = np.random.default_rng(42)
+        for gx, gvals, gc in zip(grp_pos, grp_data, grp_colors):
+            jitter = rng.uniform(-0.12, 0.12, size=len(gvals))
+            ax_bot.scatter(np.full(len(gvals), gx) + jitter, gvals,
+                           c=gc, s=30, alpha=0.6, edgecolors="black",
+                           linewidths=0.4, zorder=3)
+
+        ax_bot.set_xticks(grp_pos)
+        ax_bot.set_xticklabels(grp_labels)
+        ax_bot.set_ylabel(ylabel)
+
+        # Pairwise Mann-Whitney U brackets between all three groups
+        pairs = [(0, 1), (1, 2), (0, 2)]  # indices into grp_data/grp_pos
+        pair_labels = [("Naive", "MS_Zero"), ("MS_Zero", "v4_MS"),
+                       ("Naive", "v4_MS")]
+        all_max = max(np.max(d) for d in grp_data if len(d) > 0)
+        bracket_gap = all_max * 0.07
+        tick_h = all_max * 0.015
+
+        for level, (i1, i2) in enumerate(pairs):
+            d1, d2 = grp_data[i1], grp_data[i2]
+            if len(d1) >= 3 and len(d2) >= 3:
+                _, p_val = mannwhitneyu(d1, d2, alternative="two-sided")
+                stars = _p_to_stars(p_val)
+                sig_color = "#e67e22" if p_val < 0.05 else "#bbbbbb"
+                x1, x2 = grp_pos[i1], grp_pos[i2]
+                by = all_max * 1.06 + level * bracket_gap
+                ax_bot.plot([x1, x1, x2, x2],
+                            [by - tick_h, by, by, by - tick_h],
+                            color=sig_color, linewidth=1.0, clip_on=False)
+                ax_bot.text((x1 + x2) / 2, by + tick_h * 0.5, stars,
+                            ha="center", va="bottom", fontsize=7.5,
+                            color=sig_color,
+                            fontweight="bold" if p_val < 0.05 else "normal",
+                            clip_on=False)
+
+        # y-limits — account for brackets
+        if ylim is not None:
+            ax_top.set_ylim(ylim)
+            ax_bot.set_ylim(ylim[0], ylim[1] * 1.15)
+        else:
+            combined = np.concatenate([d for d in grp_data if len(d) > 0]
+                                      + [transform(ms_df[col].values)])
+            y_max = np.max(combined) * 1.35
+            ax_top.set_ylim(0, np.max(combined) * 1.20)
+            ax_bot.set_ylim(0, y_max)
+
+    # Legend
+    from matplotlib.patches import Patch
+    legend_handles = [
+        Patch(facecolor=color_naive, alpha=0.5, edgecolor="black",
+              label="Naive test (D5\u2013D7)"),
+        Patch(facecolor=color_zero, alpha=0.5, edgecolor="black",
+              label="MS_Zero (D8\u2013D16, left cam)"),
+        Patch(facecolor=color_v4, alpha=0.5, edgecolor="black",
+              label="v4_MS (D8\u2013D16, right cam)"),
+    ]
+    axes[0, -1].legend(handles=legend_handles, loc="upper left",
+                       title="Condition", fontsize=8, title_fontsize=9,
+                       bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
+
+    # Row labels
+    axes[0, 0].annotate("Per-day comparison", xy=(0, 0.5),
+                        xytext=(-0.35, 0.5), xycoords="axes fraction",
+                        fontsize=10, fontweight="bold", rotation=90,
+                        va="center", ha="center")
+    axes[1, 0].annotate("Pooled comparison", xy=(0, 0.5),
+                        xytext=(-0.35, 0.5), xycoords="axes fraction",
+                        fontsize=10, fontweight="bold", rotation=90,
+                        va="center", ha="center")
+
+    fig.suptitle("Behavior Metrics — Naive (D5\u2013D7) vs Scope Habituation (D8\u2013D16): MS_Zero vs v4_MS",
+                 fontsize=14, y=0.98)
+    fig.tight_layout(rect=[0.03, 0, 0.93, 0.96])
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_naive_vs_test(results_df, save_path):
+    """Publication figure: Naive (D5-D7) vs Scope Test MS_Zero & v4_MS (D14-D16).
+
+    Single row, 4 metrics. Three groups per panel with pairwise
+    Mann-Whitney U brackets and sample size (n) annotations.
+    """
+    from scipy.stats import mannwhitneyu
+    from matplotlib.patches import Patch
+
+    df = results_df.copy()
+    df["day_num"] = df["Day"].str[1:].astype(int)
+    df["Miniscope"] = df["Camera"].map({
+        "left_camera": "MS_Zero", "right_camera": "v4_MS"})
+
+    naive_df = df[df["day_num"].between(5, 7)].copy()
+    test_df  = df[df["day_num"].between(14, 16)].copy()
+
+    color_naive = "#2ca89a"
+    color_zero  = "#4daf4a"
+    color_v4    = "#984ea3"
+
+    metrics_to_plot = [
+        ("total_distance_cm", "Total Distance",
+         lambda x: x / 100, "Distance (m)", None),
+        ("median_locomotion_speed_cms", "Locomotion Speed\n(excl. immobile)",
+         lambda x: x, "Speed (cm/s)", None),
+        ("center_distance_cm", "Distance in Center",
+         lambda x: x / 100, "Distance (m)", (0, 30)),
+        ("immobility_time_s", "Immobility Time",
+         lambda x: x / 60, "Time (min)", None),
+    ]
+    n_metrics = len(metrics_to_plot)
+
+    fig, axes = plt.subplots(1, n_metrics, figsize=(16, 5))
+    rng = np.random.default_rng(42)
+
+    for col_idx, (col, title, transform, ylabel, ylim) in enumerate(metrics_to_plot):
+        ax = axes[col_idx]
+
+        # Open axes: remove top and right spines
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+        vals_naive = transform(naive_df[col].values)
+        vals_zero  = transform(test_df[test_df["Miniscope"] == "MS_Zero"][col].values)
+        vals_v4    = transform(test_df[test_df["Miniscope"] == "v4_MS"][col].values)
+
+        grp_data   = [vals_naive, vals_zero, vals_v4]
+        grp_pos    = [1, 2, 3]
+        grp_colors = [color_naive, color_zero, color_v4]
+        grp_labels = ["Control", "MS_Zero", "v4_MS"]
+
+        bp = ax.boxplot(
+            grp_data, positions=grp_pos, widths=0.5,
+            patch_artist=True, showfliers=False,
+            medianprops=dict(color="black", linewidth=2),
+            whiskerprops=dict(color="gray"),
+            capprops=dict(color="gray"))
+        for patch, fc in zip(bp["boxes"], grp_colors):
+            patch.set_facecolor(fc)
+            patch.set_alpha(0.5)
+
+        for gx, gvals, gc in zip(grp_pos, grp_data, grp_colors):
+            jitter = rng.uniform(-0.12, 0.12, size=len(gvals))
+            ax.scatter(np.full(len(gvals), gx) + jitter, gvals,
+                       c=gc, s=18, alpha=0.6, edgecolors="black",
+                       linewidths=0.3, zorder=3)
+
+        ax.set_xticks(grp_pos)
+        ax.set_xticklabels(grp_labels, fontsize=8)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=10)
+
+        # Pairwise brackets: only show significant comparisons
+        pairs = [(0, 1), (1, 2), (0, 2)]
+        all_max = max(np.max(d) for d in grp_data if len(d) > 0)
+        bracket_gap = all_max * 0.08
+        tick_h = all_max * 0.015
+
+        sig_level = 0
+        for i1, i2 in pairs:
+            d1, d2 = grp_data[i1], grp_data[i2]
+            if len(d1) >= 3 and len(d2) >= 3:
+                _, p_val = mannwhitneyu(d1, d2, alternative="two-sided")
+                if p_val >= 0.05:
+                    continue
+                stars = _p_to_stars(p_val)
+                x1, x2 = grp_pos[i1], grp_pos[i2]
+                by = all_max * 1.06 + sig_level * bracket_gap
+                ax.plot([x1, x1, x2, x2],
+                        [by - tick_h, by, by, by - tick_h],
+                        color="#e67e22", linewidth=1.0, clip_on=False)
+                ax.text((x1 + x2) / 2, by + tick_h * 0.5,
+                        stars,
+                        ha="center", va="bottom", fontsize=9,
+                        color="#e67e22", fontweight="bold",
+                        clip_on=False)
+                sig_level += 1
+
+        if ylim is not None:
+            ax.set_ylim(ylim)
+        else:
+            ax.set_ylim(0, all_max * 1.45)
+
+    fig.suptitle("Control vs Scope Test \u2014 MS_Zero vs v4_MS",
+                 fontsize=13, y=0.98)
+    fig.tight_layout(rect=[0.01, 0, 0.98, 0.94])
+    fig.savefig(save_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_publication_figure(results_df, save_path):
+    """Publication figure: 2 rows x 3 metrics.
+
+    Top row:    Pooled comparison — Naive (D5-D7) vs MS_Zero (D8-D16) vs
+                v4_MS (D8-D16) with individual data points and Mann-Whitney U.
+    Bottom row: Phase-split comparison — Scope Habituation (D8-D13) and
+                Scope Test (D14-D16), each MS_Zero vs v4_MS.
+    """
+    from scipy.stats import mannwhitneyu
+    from matplotlib.patches import Patch
+
+    df = results_df.copy()
+    df["day_num"] = df["Day"].str[1:].astype(int)
+    df["Miniscope"] = df["Camera"].map({
+        "left_camera": "MS_Zero", "right_camera": "v4_MS"})
+
+    naive_df = df[df["day_num"].between(5, 7)].copy()
+    ms_df    = df[df["day_num"] >= 8].copy()
+    hab_df   = df[df["day_num"].between(8, 13)].copy()
+    test_df  = df[df["day_num"].between(14, 16)].copy()
+
+    color_naive = "#2ca89a"
+    color_zero  = "#4daf4a"
+    color_v4    = "#984ea3"
+    # Lighter shades for habituation, saturated for test
+    color_zero_hab  = "#a2d99c"
+    color_v4_hab    = "#c5a3d9"
+    color_zero_test = "#2d8e29"
+    color_v4_test   = "#6a2c91"
+
+    metrics_to_plot = [
+        ("total_distance_cm", "Total Distance",
+         lambda x: x / 100, "Distance (m)"),
+        ("median_locomotion_speed_cms", "Median Locomotion Speed\n(excl. immobile)",
+         lambda x: x, "Speed (cm/s)"),
+        ("center_distance_cm", "Distance in Center",
+         lambda x: x / 100, "Distance (m)"),
+    ]
+    n_metrics = len(metrics_to_plot)
+
+    fig, axes = plt.subplots(2, n_metrics, figsize=(14, 9))
+    rng = np.random.default_rng(42)
+
+    def _draw_brackets(ax, grp_data, grp_pos, pairs):
+        """Draw Mann-Whitney U brackets between specified pairs."""
+        all_max = max(np.max(d) for d in grp_data if len(d) > 0)
+        bracket_gap = all_max * 0.08
+        tick_h = all_max * 0.015
+        for level, (i1, i2) in enumerate(pairs):
+            d1, d2 = grp_data[i1], grp_data[i2]
+            if len(d1) >= 3 and len(d2) >= 3:
+                _, p_val = mannwhitneyu(d1, d2, alternative="two-sided")
+                stars = _p_to_stars(p_val)
+                sig_color = "#e67e22" if p_val < 0.05 else "#bbbbbb"
+                x1, x2 = grp_pos[i1], grp_pos[i2]
+                by = all_max * 1.06 + level * bracket_gap
+                ax.plot([x1, x1, x2, x2],
+                        [by - tick_h, by, by, by - tick_h],
+                        color=sig_color, linewidth=1.0, clip_on=False)
+                ax.text((x1 + x2) / 2, by + tick_h * 0.5,
+                        f"{stars}\n{_fmt_p(p_val)}",
+                        ha="center", va="bottom", fontsize=7,
+                        color=sig_color,
+                        fontweight="bold" if p_val < 0.05 else "normal",
+                        clip_on=False)
+
+    for col_idx, (col, title, transform, ylabel) in enumerate(metrics_to_plot):
+        ax_top = axes[0, col_idx]
+        ax_bot = axes[1, col_idx]
+
+        # ── Top row: pooled 3-group (same as miniscope_comparison bottom) ──
+        all_naive = transform(naive_df[col].values)
+        all_zero  = transform(ms_df[ms_df["Miniscope"] == "MS_Zero"][col].values)
+        all_v4    = transform(ms_df[ms_df["Miniscope"] == "v4_MS"][col].values)
+
+        grp_data   = [all_naive, all_zero, all_v4]
+        grp_pos    = [1, 2, 3]
+        grp_colors = [color_naive, color_zero, color_v4]
+        grp_labels = ["Naive\n(D5\u2013D7)", "MS_Zero\n(D8\u2013D16)",
+                       "v4_MS\n(D8\u2013D16)"]
+
+        bp = ax_top.boxplot(
+            grp_data, positions=grp_pos, widths=0.5,
+            patch_artist=True, showfliers=False,
+            medianprops=dict(color="black", linewidth=2),
+            whiskerprops=dict(color="gray"),
+            capprops=dict(color="gray"))
+        for patch, fc in zip(bp["boxes"], grp_colors):
+            patch.set_facecolor(fc)
+            patch.set_alpha(0.5)
+
+        for gx, gvals, gc in zip(grp_pos, grp_data, grp_colors):
+            jitter = rng.uniform(-0.12, 0.12, size=len(gvals))
+            ax_top.scatter(np.full(len(gvals), gx) + jitter, gvals,
+                           c=gc, s=30, alpha=0.6, edgecolors="black",
+                           linewidths=0.4, zorder=3)
+
+        ax_top.set_xticks(grp_pos)
+        ax_top.set_xticklabels(grp_labels, fontsize=8)
+        ax_top.set_ylabel(ylabel)
+        ax_top.set_title(title, fontsize=10)
+
+        _draw_brackets(ax_top, grp_data, grp_pos,
+                       [(0, 1), (1, 2), (0, 2)])
+
+        combined_top = np.concatenate([d for d in grp_data if len(d) > 0])
+        ax_top.set_ylim(0, np.max(combined_top) * 1.40)
+
+        # ── Bottom row: 5-group phase split (Naive + Hab + Test) ──
+        bot_naive = transform(naive_df[col].values)
+        hab_zero  = transform(hab_df[hab_df["Miniscope"] == "MS_Zero"][col].values)
+        hab_v4    = transform(hab_df[hab_df["Miniscope"] == "v4_MS"][col].values)
+        test_zero = transform(test_df[test_df["Miniscope"] == "MS_Zero"][col].values)
+        test_v4   = transform(test_df[test_df["Miniscope"] == "v4_MS"][col].values)
+
+        grp5_data   = [bot_naive, hab_zero, hab_v4, test_zero, test_v4]
+        grp5_pos    = [1, 2.8, 3.8, 5.6, 6.6]
+        grp5_colors = [color_naive, color_zero_hab, color_v4_hab,
+                        color_zero_test, color_v4_test]
+        grp5_labels = ["Naive", "MS_Zero", "v4_MS", "MS_Zero", "v4_MS"]
+
+        bp5 = ax_bot.boxplot(
+            grp5_data, positions=grp5_pos, widths=0.5,
+            patch_artist=True, showfliers=False,
+            medianprops=dict(color="black", linewidth=2),
+            whiskerprops=dict(color="gray"),
+            capprops=dict(color="gray"))
+        for patch, fc in zip(bp5["boxes"], grp5_colors):
+            patch.set_facecolor(fc)
+            patch.set_alpha(0.6)
+
+        for gx, gvals, gc in zip(grp5_pos, grp5_data, grp5_colors):
+            jitter = rng.uniform(-0.12, 0.12, size=len(gvals))
+            ax_bot.scatter(np.full(len(gvals), gx) + jitter, gvals,
+                           c=gc, s=30, alpha=0.6, edgecolors="black",
+                           linewidths=0.4, zorder=3)
+
+        ax_bot.set_xticks(grp5_pos)
+        ax_bot.set_xticklabels(grp5_labels, fontsize=8)
+        ax_bot.set_ylabel(ylabel)
+
+        # Phase group labels below x-axis
+        ax_bot.text(1.0, -0.18, "Naive\n(D5\u2013D7)",
+                    transform=ax_bot.get_xaxis_transform(),
+                    ha="center", va="top", fontsize=8, fontweight="bold")
+        ax_bot.text(3.3, -0.18, "Scope Habituation\n(D8\u2013D13)",
+                    transform=ax_bot.get_xaxis_transform(),
+                    ha="center", va="top", fontsize=8, fontweight="bold")
+        ax_bot.text(6.1, -0.18, "Scope Test\n(D14\u2013D16)",
+                    transform=ax_bot.get_xaxis_transform(),
+                    ha="center", va="top", fontsize=8, fontweight="bold")
+
+        # Brackets: MS_Zero vs v4_MS within each phase,
+        # plus Naive vs each scope test group
+        _draw_brackets(ax_bot, grp5_data, grp5_pos,
+                       [(1, 2), (3, 4), (0, 3), (0, 4)])
+
+        combined_bot = np.concatenate([d for d in grp5_data if len(d) > 0])
+        ax_bot.set_ylim(0, np.max(combined_bot) * 1.55)
+
+    # ── Legends ──
+    top_handles = [
+        Patch(facecolor=color_naive, alpha=0.5, edgecolor="black",
+              label="Naive (D5\u2013D7)"),
+        Patch(facecolor=color_zero, alpha=0.5, edgecolor="black",
+              label="MS_Zero (D8\u2013D16)"),
+        Patch(facecolor=color_v4, alpha=0.5, edgecolor="black",
+              label="v4_MS (D8\u2013D16)"),
+    ]
+    axes[0, -1].legend(handles=top_handles, loc="upper left",
+                       fontsize=7, title="Condition", title_fontsize=8,
+                       bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
+
+    bot_handles = [
+        Patch(facecolor=color_naive, alpha=0.6, edgecolor="black",
+              label="Naive (D5\u2013D7)"),
+        Patch(facecolor=color_zero_hab, alpha=0.6, edgecolor="black",
+              label="MS_Zero \u2013 Hab (D8\u2013D13)"),
+        Patch(facecolor=color_v4_hab, alpha=0.6, edgecolor="black",
+              label="v4_MS \u2013 Hab (D8\u2013D13)"),
+        Patch(facecolor=color_zero_test, alpha=0.6, edgecolor="black",
+              label="MS_Zero \u2013 Test (D14\u2013D16)"),
+        Patch(facecolor=color_v4_test, alpha=0.6, edgecolor="black",
+              label="v4_MS \u2013 Test (D14\u2013D16)"),
+    ]
+    axes[1, -1].legend(handles=bot_handles, loc="upper left",
+                       fontsize=7, title="Phase", title_fontsize=8,
+                       bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
+
+    # Row labels
+    axes[0, 0].annotate("Pooled (D8\u2013D16)", xy=(0, 0.5),
+                        xytext=(-0.35, 0.5), xycoords="axes fraction",
+                        fontsize=10, fontweight="bold", rotation=90,
+                        va="center", ha="center")
+    axes[1, 0].annotate("Habituation vs Test", xy=(0, 0.5),
+                        xytext=(-0.35, 0.5), xycoords="axes fraction",
+                        fontsize=10, fontweight="bold", rotation=90,
+                        va="center", ha="center")
+
+    fig.suptitle("MS_Zero vs v4_MS \u2014 Behavioral Comparison",
+                 fontsize=13, y=0.98)
+    fig.tight_layout(rect=[0.04, 0.05, 0.92, 0.96])
+    fig.savefig(save_path, dpi=300)
+    plt.close(fig)
+
 
 # ============================================================================
 # MAIN PROCESSING
@@ -970,6 +1588,9 @@ def compute_population_bounds(all_metrics, n_sd=2):
     return bounds
 
 
+EXCLUDE_ANIMALS = {"M04"}  # M04 lost scope from D15; exclude for balanced comparisons
+
+
 def main():
     days = sorted([d for d in os.listdir(BASE_DIR) if d.endswith("_DLC")])
     all_results = []  # list of (metrics, stages, arena_bounds, meta, plot_path)
@@ -993,6 +1614,8 @@ def main():
                 if not os.path.isdir(animal_dir):
                     continue
                 animal = os.path.basename(animal_dir)
+                if animal in EXCLUDE_ANIMALS:
+                    continue
                 csv_files = glob.glob(os.path.join(animal_dir, "*.csv"))
                 if not csv_files:
                     continue
@@ -1038,10 +1661,25 @@ def main():
     results.to_csv(csv_out, index=False)
     print(f"\nCSV saved: {csv_out}")
 
-    # Summary boxplot
+    # Summary boxplot (naive baseline)
     summary_path = os.path.join(PLOT_DIR, "summary_boxplots.png")
     plot_summary_boxplots(results, summary_path)
     print(f"Summary plot saved: {summary_path}")
+
+    # Miniscope comparison (D8+)
+    ms_compare_path = os.path.join(PLOT_DIR, "miniscope_comparison.png")
+    plot_miniscope_comparison(results, ms_compare_path)
+    print(f"Miniscope comparison plot saved: {ms_compare_path}")
+
+    # Publication figure (pooled + habituation vs test)
+    pub_path = os.path.join(PLOT_DIR, "publication_figure.png")
+    plot_publication_figure(results, pub_path)
+    print(f"Publication figure saved: {pub_path}")
+
+    # Publication figure (naive vs scope test)
+    naive_test_path = os.path.join(PLOT_DIR, "publication_naive_vs_test.png")
+    plot_naive_vs_test(results, naive_test_path)
+    print(f"Naive vs test figure saved: {naive_test_path}")
 
     # Console summary
     print("\n" + "=" * 110)

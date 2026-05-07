@@ -7,8 +7,7 @@ identity:
 
 
 # Project path (change when moving around)
-project_path: 
-  C:\Users\marce\Documents\DeepLabCut\topmouse_project-marcel-2026-03-24
+project_path: C:\Users\marce\Documents\Git\batch_DLC_analysis_pipeline
 
 
 # Default DeepLabCut engine to use for shuffle creation (either pytorch or tensorflow)
@@ -17,8 +16,8 @@ engine: pytorch
 
 # Annotation data set configuration (and individual video cropping parameters)
 video_sets:
-  C:\Users\marce\Downloads\1774390462_M09_D5_naive1.mp4:
-    crop: 0, 1024, 0, 768
+  ? D:\marcel\Miniscope_Zero_2025_11\v4_vs_MSzero_behavior\raw_videos\left_camera_1_raw_video\1776211293_M02_D16_Exp2.mp4
+  : crop: 0, 1024, 0, 768
 bodyparts:
 - nose
 - left_ear
@@ -47,6 +46,9 @@ bodyparts:
 - right_hip
 - tail_end
 - head_midpoint
+
+
+# Fraction of video to start/stop when extracting frames for labeling/refinement
 start: 0
 stop: 1
 numframes2pick: 20
